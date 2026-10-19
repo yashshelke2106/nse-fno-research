@@ -1,0 +1,829 @@
+import logging
+import os
+import pandas as pd
+import numpy as np
+import time
+from typing import Dict, Optional, List
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+import config
+from .risk_engine import Position, RiskEngine, Trade
+from .strike_selection import StrikeRecommendation
+
+log = logging.getLogger(__name__)
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _paper_mode() -> bool:
+    """Only an explicit PAPER_TRADE = False goes live.
+
+    This read `getattr(config, 'PAPER_TRADE', False)`: a config without the
+    flag - a stripped-down copy, a worktree stub, a typo in the name - meant
+    LIVE orders. The safe state was the one that needed a line of config to
+    exist. Now absent, None, 0 or a string all mean paper.
+    """
+    # Public version: always paper. Live order placement is not included
+    # (see core.api_dhan.LIVE_TRADING_ENABLED), so this cannot be switched off.
+    return True
+
+
+@dataclass
+class OrderResult:
+    success: bool
+    order_id: str
+    filled_price: float
+    filled_quantity: int
+    message: str
+    retry_count: int
+
+
+class ExecutionEngine:
+    def __init__(self, capital: float = 100000):
+        self.config = config.EXECUTION_CONFIG
+        self.risk = RiskEngine(capital=capital)
+        self.pending_orders = []
+        self.filled_orders = []
+        self.order_id_counter = 0
+        self.dhan_api = None
+        self.nse_api = None
+        self._init_apis()
+
+    def _init_apis(self):
+        if not config.USE_MOCK_DATA:
+            try:
+                from .api_dhan import dhan_api
+                self.dhan_api = dhan_api
+            except Exception as e:
+                print(f"[WARN] Dhan API init failed: {e}")
+
+            try:
+                from .api_nse import nse_api
+                self.nse_api = nse_api
+            except Exception as e:
+                print(f"[WARN] NSE API init failed: {e}")
+
+    def generate_order_id(self) -> str:
+        self.order_id_counter += 1
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        return f"ORD_{stamp}_{self.order_id_counter:04d}"
+
+    # ---- honest PAPER fills -------------------------------------------------
+    # A paper fill must model what a live order would actually get, not the
+    # price we asked for. Perfect fills at the requested price (the old
+    # `price or 2500`) are exactly the mirage that inflated results. These
+    # helpers price a paper fill off the LIVE quote and CROSS the spread +
+    # slippage. They NEVER place an order — read-only quotes only.
+    _DEFAULT_FILL_COST_BPS = {"equity": 5, "futures": 5, "option": 50}
+
+    def _live_ref_price(self, symbol, kind, option_strike=None, option_type=None):
+        """Best available LIVE reference price for a paper fill, or None.
+        Read-only: fetches a quote, never an order."""
+        if not self.dhan_api:
+            return None
+        try:
+            if kind == "option" and option_strike and option_type:
+                exp = self._next_nse_expiry(symbol)
+                ce_pe = "CE" if str(option_type).upper().startswith("C") else "PE"
+                ltp = self.dhan_api.get_option_quote(symbol, exp, float(option_strike), ce_pe)
+                return float(ltp) if ltp else None
+            q = self.dhan_api.get_quote([symbol])
+            items = q.get("data") if isinstance(q, dict) else None
+            if items:
+                lp = items[0].get("last_price") or items[0].get("lastTradedPrice")
+                return float(lp) if lp else None
+        except Exception as e:
+            print(f"[PAPER] live quote failed for {symbol}: {e}")
+        return None
+
+    def _paper_fill(self, symbol, tx, requested, kind,
+                    option_strike=None, option_type=None):
+        """Model a realistic paper fill: cross the spread + slippage on the LIVE
+        reference price. Falls back to the requested price (with a warning) when
+        no live quote is available — but NEVER a hardcoded nominal. Returns
+        (filled_price, source) or (None, 'no_price')."""
+        ref = self._live_ref_price(symbol, kind, option_strike, option_type)
+        source = "live"
+        if ref is None:
+            ref, source = requested, "requested(no-live-quote)"
+        if not ref or ref <= 0:
+            return None, "no_price"
+        cost = getattr(config, "PAPER_FILL_COST_BPS", None)
+        if not isinstance(cost, dict):
+            cost = self._DEFAULT_FILL_COST_BPS
+        adj = cost.get(kind, 5) / 1e4          # half-spread crossed + slippage
+        px = ref * (1 + adj) if tx == "BUY" else ref * (1 - adj)
+        return round(px, 2), source
+
+    def place_order(self, symbol: str, direction: str, quantity: int,
+                  order_type: str = "LIMIT", price: float = None,
+                  is_option: bool = False, option_strike: float = None,
+                  option_type: str = None, is_futures: bool = False) -> OrderResult:
+
+        for attempt in range(self.config['retry_attempts']):
+            try:
+                if is_option:
+                    order_result = self._execute_option_order(
+                        symbol, direction, quantity, order_type, price,
+                        option_strike, option_type
+                    )
+                elif is_futures:
+                    order_result = self._execute_futures_order(
+                        symbol, direction, quantity, order_type, price
+                    )
+                else:
+                    order_result = self._execute_equity_order(
+                        symbol, direction, quantity, order_type, price
+                    )
+
+                if order_result.success:
+                    return order_result
+
+                time.sleep(self.config['retry_delay'])
+
+            except Exception as e:
+                print(f"[ERROR] Order attempt {attempt+1} failed for {symbol}: {e}")
+                time.sleep(self.config['retry_delay'])
+        
+        return OrderResult(
+            success=False,
+            order_id=self.generate_order_id(),
+            filled_price=0,
+            filled_quantity=0,
+            message=f"Order failed after {self.config['retry_attempts']} attempts",
+            retry_count=self.config['retry_attempts']
+        )
+
+    def _execute_equity_order(self, symbol: str, direction: str, quantity: int,
+                           order_type: str, price: float) -> OrderResult:
+        _tx = {"long": "BUY", "short": "SELL"}.get(direction.lower(), direction.upper())
+
+        if config.USE_MOCK_DATA or _paper_mode() or not self.dhan_api:
+            if config.USE_MOCK_DATA:
+                # offline MOCK: no live data source at all — keep a nominal price
+                filled_price, source, mode = (price or 2500), "mock", "MOCK"
+            else:
+                filled_price, source = self._paper_fill(symbol, _tx, price, "equity")
+                mode = "PAPER"
+                if filled_price is None:
+                    return OrderResult(
+                        success=False,
+                        order_id=self.generate_order_id(),
+                        filled_price=0,
+                        filled_quantity=0,
+                        message=f"[PAPER] {symbol}: no live price — fill refused "
+                                f"(never a silent 2500)",
+                        retry_count=0,
+                    )
+            return OrderResult(
+                success=True,
+                order_id=self.generate_order_id(),
+                filled_price=filled_price,
+                filled_quantity=quantity,
+                message=f"[{mode}] {_tx} {quantity} {symbol} @ {filled_price} ({source})",
+                retry_count=0
+            )
+
+        if self.dhan_api:
+            try:
+                result = self.dhan_api.place_order(
+                    symbol=symbol,
+                    exchange="NSE_EQ",
+                    transaction_type=_tx,
+                    quantity=quantity,
+                    order_type=order_type.upper(),
+                    price=price
+                )
+
+                # Dhan v2 uses "orderId"; v1 compat uses "order_id"
+                oid = result.get("orderId") or result.get("order_id")
+                if oid:
+                    filled_price = (result.get("tradedPrice") or result.get("traded_price")
+                                    or result.get("price") or price)
+                    return OrderResult(
+                        success=True,
+                        order_id=str(oid),
+                        filled_price=filled_price,
+                        filled_quantity=quantity,
+                        message=f"{direction.upper()} {quantity} {symbol} @ {filled_price}",
+                        retry_count=0
+                    )
+            except Exception as e:
+                print(f"[ERROR] Equity order API call failed for {symbol}: {e}")
+        
+        return OrderResult(
+            success=False,
+            order_id=self.generate_order_id(),
+            filled_price=0,
+            filled_quantity=0,
+            message="API order failed",
+            retry_count=1
+        )
+
+    def _execute_option_order(self, symbol: str, direction: str, quantity: int,
+                              order_type: str, price: float, option_strike: float,
+                              option_type: str) -> OrderResult:
+        _tx = {"long": "BUY", "short": "SELL"}.get(direction.lower(), direction.upper())
+
+        if config.USE_MOCK_DATA or _paper_mode():
+            if config.USE_MOCK_DATA:
+                filled_price, source, mode = (price or 50), "mock", "MOCK"
+            else:
+                filled_price, source = self._paper_fill(
+                    symbol, _tx, price, "option",
+                    option_strike=option_strike, option_type=option_type)
+                mode = "PAPER"
+                if filled_price is None:
+                    return OrderResult(
+                        success=False,
+                        order_id=self.generate_order_id(),
+                        filled_price=0,
+                        filled_quantity=0,
+                        message=f"[PAPER] {symbol} {option_strike}{option_type}: "
+                                f"no live premium — fill refused",
+                        retry_count=0,
+                    )
+            return OrderResult(
+                success=True,
+                order_id=self.generate_order_id(),
+                filled_price=filled_price,
+                filled_quantity=quantity,
+                message=f"[{mode}] {_tx} {quantity} {symbol} {option_strike}{option_type} @ {filled_price} ({source})",
+                retry_count=0
+            )
+
+        if self.dhan_api:
+            try:
+                strike_int = int(option_strike)
+                expiry = self._next_nse_expiry(symbol)
+                option_symbol = f"{symbol}{expiry}{option_type}{strike_int}"
+
+                result = self.dhan_api.place_order(
+                    symbol=option_symbol,
+                    exchange="NSE_FO",
+                    transaction_type=_tx,
+                    quantity=quantity,
+                    order_type=order_type.upper(),
+                    price=price
+                )
+
+                oid = result.get("orderId") or result.get("order_id")
+                if oid:
+                    filled_price = (result.get("tradedPrice") or result.get("traded_price")
+                                    or result.get("price") or price)
+                    return OrderResult(
+                        success=True,
+                        order_id=str(oid),
+                        filled_price=filled_price,
+                        filled_quantity=quantity,
+                        message=f"{_tx} {quantity} {option_symbol} @ {filled_price}",
+                        retry_count=0
+                    )
+            except Exception as e:
+                print(f"[ERROR] Options order API call failed for {symbol}: {e}")
+        
+        return OrderResult(
+            success=False,
+            order_id=self.generate_order_id(),
+            filled_price=0,
+            filled_quantity=0,
+            message="Options order failed",
+            retry_count=1
+        )
+
+    def _execute_futures_order(self, symbol: str, direction: str, quantity: int,
+                               order_type: str, price: float) -> OrderResult:
+        """Place a STOCK FUTURES order.
+
+        Unlike options, the future is delta~1 with no theta/IV — direction maps
+        straight to BUY/SELL. Quantity is already a lot multiple from the
+        futures leg. Live path uses Dhan NSE_FNO segment + the current-month
+        futures trading symbol + MARGIN product type.
+        """
+        _tx = {"long": "BUY", "short": "SELL"}.get(direction.lower(), direction.upper())
+
+        # PAPER / MOCK: simulate the fill (no real order)
+        if config.USE_MOCK_DATA or _paper_mode() or not self.dhan_api:
+            if config.USE_MOCK_DATA:
+                filled_price, source, mode = (price or 0), "mock", "MOCK"
+            else:
+                filled_price, source = self._paper_fill(symbol, _tx, price, "futures")
+                mode = "PAPER"
+                if filled_price is None:
+                    return OrderResult(
+                        success=False,
+                        order_id=self.generate_order_id(),
+                        filled_price=0,
+                        filled_quantity=0,
+                        message=f"[PAPER] {symbol}-FUT: no live price — fill refused",
+                        retry_count=0,
+                    )
+            return OrderResult(
+                success=True,
+                order_id=self.generate_order_id(),
+                filled_price=filled_price,
+                filled_quantity=quantity,
+                message=f"[{mode}] {_tx} {quantity} {symbol}-FUT @ {filled_price} ({source})",
+                retry_count=0,
+            )
+
+        # LIVE: real Dhan futures order
+        if self.dhan_api:
+            try:
+                expiry = self._next_nse_expiry(symbol)
+                fut_symbol = f"{symbol}{expiry}FUT"
+                result = self.dhan_api.place_order(
+                    symbol=fut_symbol,
+                    exchange="NSE_FNO",          # stock futures segment
+                    transaction_type=_tx,
+                    quantity=quantity,
+                    order_type=order_type.upper(),
+                    price=price,
+                    product_type="MARGIN",       # carry-forward futures (not INTRADAY)
+                )
+                oid = result.get("orderId") or result.get("order_id")
+                if oid:
+                    filled_price = (result.get("tradedPrice") or result.get("traded_price")
+                                    or result.get("price") or price)
+                    return OrderResult(
+                        success=True,
+                        order_id=str(oid),
+                        filled_price=filled_price,
+                        filled_quantity=quantity,
+                        message=f"{_tx} {quantity} {fut_symbol} @ {filled_price}",
+                        retry_count=0,
+                    )
+            except Exception as e:
+                print(f"[ERROR] Futures order API call failed for {symbol}: {e}")
+
+        return OrderResult(
+            success=False,
+            order_id=self.generate_order_id(),
+            filled_price=0,
+            filled_quantity=0,
+            message="Futures order failed",
+            retry_count=1,
+        )
+
+    @staticmethod
+    def _next_nse_expiry(symbol: str = "") -> str:
+        """Return nearest NSE F&O expiry as DDMONYY string, holiday-adjusted."""
+        from .nse_calendar import expiry_str_ddmonyy
+        return expiry_str_ddmonyy(symbol or "NIFTY")
+
+    def calculate_slippage(self, price: float, direction: str) -> float:
+        slippage = price * self.config['slippage_tolerance']
+        
+        if direction == "long":
+            return price + slippage
+        else:
+            return price - slippage
+
+    def execute_trade(self, symbol: str, direction: str, capital: float,
+                   entry_price: float, atr: float, strike: Optional[StrikeRecommendation] = None,
+                   use_options: bool = False, use_futures: bool = None,
+                   entry_volume: float = 0.0, entry_vol_avg: float = 0.0,
+                   mark_prices: Optional[Dict[str, float]] = None,
+                   option_expiry: str = "") -> Optional[OrderResult]:
+        # GAP #3: option_expiry (YYYY-MM-DD) is carried from the signal dict by
+        # the caller (live_runner / aladdin_runner) so the risk engine can enforce
+        # the per-expiry concentration cap. Defaults to "" (non-option / unknown)
+        # which the expiry cap degrades gracefully to pass-through.
+        # GAP #2: mark_prices should be the live last-price of each open position.
+        # The caller (live_runner._run_pipeline) is responsible for supplying these.
+        # If not supplied, validate_trade falls back to realized-only (legacy safe).
+        if use_options and strike is None:
+            return None
+        # Default instrument from config when caller doesn't specify. Futures is
+        # the default expression of a directional swing (no theta/IV tax).
+        if use_futures is None:
+            use_futures = (getattr(config, "INSTRUMENT_MODE", "futures") == "futures"
+                           and not use_options)
+        # ATR-based SL (adapts to stock volatility); fallback to % if ATR unavailable
+        if atr and atr > 0:
+            atr_mult = config.SIGNAL_CONFIG.get('atr_multiplier', 1.5)
+            sl_distance = atr * atr_mult
+        else:
+            sl_pct = config.RISK_CONFIG.get('sl_pct', 0.10)
+            sl_distance = entry_price * sl_pct
+        sl_price = entry_price - sl_distance if direction == "long" else entry_price + sl_distance
+        min_rr = config.RISK_CONFIG.get('min_risk_reward', 1.5)
+        target_price = (entry_price + sl_distance * min_rr if direction == "long"
+                        else entry_price - sl_distance * min_rr)
+
+        if use_options or use_futures:
+            # ONE ordered pipeline for F&O: liquidity -> fundable -> live lot
+            # -> risk budget -> breach. These three branches used to size
+            # independently and disagreed: two read the stale
+            # config.NSE_LOT_SIZES (34 of 62 entries wrong, 81 names missing,
+            # which silently became lot size 1) while a third read the live
+            # scrip master, and none asked whether the account could post the
+            # margin -- so the system emitted signals a broker rejects at the
+            # order window. See core/sizing.py.
+            from core.sizing import decide as _size
+            _d = _size(
+                symbol, entry_price, sl_price, capital,
+                instrument="option_long" if use_options else "futures",
+                premium=strike.premium if use_options else None,
+                require_liquidity=getattr(config, "ENFORCE_LIQUIDITY_TIER", True),
+            )
+            self.last_size_decision = _d
+            if not _d.ok:
+                # A veto is information. Silence here is indistinguishable
+                # from "no signal today", which is how unfundable trades used
+                # to look like an idle scanner.
+                log.info(f"[SIZE] {symbol} skipped: {_d.reason}")
+                return None
+            if _d.risk_breach_multiple:
+                log.warning(f"[SIZE] {symbol} {_d.reason}")
+            quantity = _d.quantity
+            if use_options:
+                option_strike = strike.strike_price
+                option_type = strike.option_type
+                entry_with_slip = entry_price
+                premium = strike.premium
+            else:
+                option_strike = None
+                option_type = None
+                entry_with_slip = self.calculate_slippage(entry_price, direction)
+                premium = 0
+        else:
+            quantity = self.risk.calculate_quantity(capital, entry_price, sl_price, symbol=symbol)
+            option_strike = None
+            option_type = None
+            entry_with_slip = self.calculate_slippage(entry_price, direction)
+            premium = 0
+
+        if quantity <= 0:
+            return None
+
+        position = Position(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            quantity=quantity,
+            sl_price=sl_price,
+            target_price=target_price,
+            premium=premium,
+            option_strike=option_strike or 0,
+            option_type=option_type or "",
+            entry_atr=atr,
+            entry_volume=entry_volume,
+            entry_vol_avg=entry_vol_avg,
+            option_expiry=option_expiry,   # GAP #3: for expiry concentration cap
+        )
+
+        validation = self.risk.validate_trade(position, entry_price, force_allowed=True,
+                                              mark_prices=mark_prices)
+
+        if not validation['is_valid']:
+            return None
+
+        order_type = self.config['order_type'].lower()
+
+        if use_options:
+            result = self.place_order(
+                symbol, direction, quantity, order_type, strike.premium,
+                is_option=True, option_strike=option_strike, option_type=option_type
+            )
+        elif use_futures:
+            result = self.place_order(
+                symbol, direction, quantity, order_type, entry_with_slip,
+                is_futures=True
+            )
+        else:
+            result = self.place_order(
+                symbol, direction, quantity, order_type, entry_with_slip
+            )
+
+        if result.success:
+            self.risk.open_position(position, force_allowed=True)
+
+        return result
+
+    def _calculate_futures_quantity(self, capital: float, entry: float,
+                                    sl: float, symbol: str = '') -> int:
+        """Lots of stock futures sized by fixed-fractional risk.
+
+        Risk a constant % of capital per trade (RISK_CONFIG.max_risk_per_trade).
+        lots = floor( (capital * risk%) / (per-unit risk * lot_size) ), min 1 lot.
+        This gives EVEN rupee risk per trade instead of a flat 1-lot everywhere.
+        """
+        # LIVE lot size first. config.NSE_LOT_SIZES is stale (measured 2026-08-06:
+        # 34 of 62 entries wrong, 81 F&O names absent entirely -> they silently
+        # fell back to 1, which makes `lots` and therefore the rupee risk wrong).
+        from core.futures_leg import lot_size_for
+        lot_size = max(int(lot_size_for(symbol)), 1)
+        risk_per_unit = abs(entry - sl)
+        if risk_per_unit <= 0:
+            return lot_size  # 1 lot fallback
+        risk_pct = config.RISK_CONFIG.get('max_risk_per_trade', 0.01)
+        risk_budget = capital * risk_pct
+        risk_per_lot = risk_per_unit * lot_size
+        if risk_per_lot <= 0:
+            return lot_size
+        lots = int(risk_budget // risk_per_lot)
+        if lots >= 1:
+            return lots * lot_size
+
+        # ONE LOT IS TOO BIG. `max(1, lots)` used to take the trade anyway, so
+        # whenever a single lot risked more than the per-trade budget the cap
+        # was silently breached - measured up to 6.7x (KOTAKBANK, lot 2000, Rs
+        # 20 stop: Rs 40,000 of risk against a Rs 6,000 budget). A risk limit
+        # that yields whenever it binds is not a limit.
+        #
+        # Refuse instead, and say so. The breach is recorded on
+        # last_size_refusal so the reason is visible rather than a mystery
+        # empty book. ALLOW_MIN_LOT_BREACH=1 restores the old behaviour for
+        # anyone who would rather take the trade than skip the name.
+        breach = risk_per_lot / risk_budget if risk_budget > 0 else float("inf")
+        self.last_size_refusal = {
+            "symbol": symbol, "lot_size": lot_size,
+            "risk_per_lot": round(risk_per_lot, 2),
+            "risk_budget": round(risk_budget, 2),
+            "breach_multiple": round(breach, 2),
+            "note": (f"one lot risks {breach:.1f}x the per-trade budget - "
+                     f"refused (set ALLOW_MIN_LOT_BREACH=1 to override)"),
+        }
+        if os.environ.get("ALLOW_MIN_LOT_BREACH") == "1":
+            log.warning("[EXEC] %s: 1-lot risk is %.1fx the budget - taking it "
+                        "anyway (ALLOW_MIN_LOT_BREACH=1)", symbol, breach)
+            return lot_size
+        log.warning("[EXEC] %s: refusing - one lot risks %.1fx the per-trade "
+                    "budget (Rs %.0f vs Rs %.0f)", symbol, breach,
+                    risk_per_lot, risk_budget)
+        return 0
+
+    def _calculate_option_quantity(self, capital: float, premium: float,
+                                    symbol: str = '') -> int:
+        if premium <= 0:
+            return 0
+        risk_pct = config.RISK_CONFIG['max_risk_per_trade']
+        raw = int(capital * risk_pct / premium)
+        # LIVE lot size first — see _calculate_futures_quantity. An option order
+        # for a non-multiple of the lot is rejected by the exchange outright.
+        from core.futures_leg import lot_size_for
+        lot_size = int(lot_size_for(symbol)) if symbol else 1
+        if lot_size <= 1:
+            return max(1, raw)
+        return max(lot_size, (raw // lot_size) * lot_size)
+
+    def close_position(self, symbol: str, exit_price: float,
+                    reason: str = "signal") -> Optional[Trade]:
+        return self.risk.close_position(symbol, exit_price, reason)
+
+    def trail_stop_loss(self, position: Position, current_price: float,
+                     atr: float, direction: str) -> float:
+        """Progressive trailing SL — activates early, tightens as profit grows.
+
+        Old: waited for 2 ATR of profit, so most trades timed out before the trail engaged.
+        New: 3-tier system:
+          0.5 ATR profit → trail 1.5 ATR behind (lock ~breakeven)
+          1.0 ATR profit → trail 1.0 ATR behind (lock partial gain)
+          1.5 ATR profit → trail 0.7 ATR behind (tight, capture most of move)
+        """
+        if atr <= 0:
+            return position.sl_price
+
+        if direction == "long":
+            profit_atr = (current_price - position.entry_price) / atr
+            if profit_atr >= 1.5:
+                new_sl = current_price - atr * 0.7
+            elif profit_atr >= 1.0:
+                new_sl = current_price - atr * 1.0
+            elif profit_atr >= 0.5:
+                new_sl = current_price - atr * 1.5
+            else:
+                return position.sl_price
+            return max(new_sl, position.sl_price)
+        else:
+            profit_atr = (position.entry_price - current_price) / atr
+            if profit_atr >= 1.5:
+                new_sl = current_price + atr * 0.7
+            elif profit_atr >= 1.0:
+                new_sl = current_price + atr * 1.0
+            elif profit_atr >= 0.5:
+                new_sl = current_price + atr * 1.5
+            else:
+                return position.sl_price
+            return min(new_sl, position.sl_price)
+
+    def _check_volume_exit(self, position: Position, df, current_price: float) -> bool:
+        """Exit when volume dries up after inflow surge (while in profit)."""
+        vec = config.VOLUME_EXIT_CONFIG
+        if df is None or len(df) < vec['vol_surge_lookback']:
+            return False
+
+        avg_vol = df['volume'].rolling(vec['vol_surge_lookback']).mean().iloc[-1]
+        current_vol = float(df['volume'].iloc[-1])
+        if avg_vol <= 0:
+            return False
+
+        vol_ratio = current_vol / avg_vol
+
+        min_profit = vec['profit_required_pct']
+        if position.direction == "long":
+            in_profit = current_price > position.entry_price * (1 + min_profit)
+        else:
+            in_profit = current_price < position.entry_price * (1 - min_profit)
+
+        if not in_profit:
+            return False
+
+        was_vol_surge = (position.entry_vol_avg > 0 and
+                         position.entry_volume > position.entry_vol_avg * 1.5)
+        vol_drying = vol_ratio < vec['exit_vol_threshold']
+
+        return was_vol_surge and vol_drying
+
+    def _check_time_exit(self, position: Position, current_price: float) -> Optional[str]:
+        """Time/scratch exits — kill the 46% TIME_EXIT bleed.
+
+        A trade that neither hits its target nor its stop chops sideways
+        while option theta decays; a trade that is working tends to work
+        quickly. So:
+
+          1. EOD exit (15:10 IST) — no overnight F&O risk
+          2. FAST time-stop: >35min AND below +0.3R → trade isn't working,
+             cut before theta + reversal eat it (was 60min/−0.7%)
+          3. SCRATCH exit: trade went green (peak ≥ +0.4%) then faded back
+             to ≤ +0.05% → exit flat instead of riding to SL
+          4. Profit time exit: >75min, >1% profit, partial booked
+          5. Stale: >120min and going nowhere (was 180min)
+        """
+        now = datetime.now(_IST)
+        elapsed = (now - position.entry_time.replace(tzinfo=_IST)).total_seconds()
+        elapsed_min = elapsed / 60.0
+
+        # EOD forced exit — no overnight F&O risk
+        if now.hour >= 15 and now.minute >= 10:
+            return "EOD_EXIT"
+
+        if position.direction == "long":
+            pnl_pct = (current_price - position.entry_price) / position.entry_price
+        else:
+            pnl_pct = (position.entry_price - current_price) / position.entry_price
+
+        # Risk unit (R) — prefer entry SL distance, fallback ATR, then 1%
+        risk = 0.0
+        if getattr(position, "entry_sl", 0):
+            risk = abs(position.entry_price - position.entry_sl) / position.entry_price
+        if risk <= 0 and getattr(position, "entry_atr", 0):
+            risk = position.entry_atr / position.entry_price
+        if risk <= 0:
+            risk = 0.01
+        r_mult = pnl_pct / risk if risk > 0 else 0.0
+
+        # Track peak favorable pnl for scratch logic
+        peak = getattr(position, "_peak_pnl_pct", 0.0)
+        if pnl_pct > peak:
+            peak = pnl_pct
+            try:
+                position._peak_pnl_pct = peak
+            except Exception:
+                pass
+
+        # ── 2. FAST time-stop — not working within 35min ─────────────────
+        # Most real breakouts move within 2-3 bars (10-15min). If after
+        # 35min we're below +0.3R, the thesis failed — cut now.
+        if elapsed_min >= 35 and r_mult < 0.3 and not getattr(position, "partial_booked", False):
+            return "FAST_TIME_EXIT"
+
+        # ── 3. SCRATCH exit — gave back the gain ─────────────────────────
+        # Went green ≥ +0.4% then collapsed back to flat. Don't donate it
+        # back to the SL. Exit at scratch.
+        if peak >= 0.004 and pnl_pct <= 0.0005 and not getattr(position, "partial_booked", False):
+            return "SCRATCH_EXIT"
+
+        # ── 4. Profitable but stagnating (partial booked already) ────────
+        if elapsed_min >= 75 and pnl_pct > 0.010 and getattr(position, 'partial_booked', False):
+            return "TIME_PROFIT_EXIT"
+
+        # ── 5. Stale — 2hrs+ and going nowhere ───────────────────────────
+        if elapsed_min >= 120 and pnl_pct < 0.005:
+            return "STALE_EXIT"
+
+        return None
+
+    def manage_open_positions(self, get_price_func, get_data_func=None) -> List[Dict]:
+        closed = []
+
+        positions = list(self.risk.get_open_positions())
+
+        for position in positions:
+            current_price = get_price_func(position.symbol)
+
+            if current_price is None:
+                continue
+
+            # Priority 1: SL hit — always exit
+            if self.risk.check_sl_hit(position, current_price):
+                result = self.close_position(position.symbol, current_price, "SL_HIT")
+                closed.append({
+                    'symbol': position.symbol,
+                    'action': 'CLOSED',
+                    'reason': 'SL_HIT',
+                    'trade': result
+                })
+
+            # Priority 2: Target hit — partial at T1, runner aims for T2
+            elif self.risk.check_target_hit(position, current_price):
+                if not position.partial_booked and position.quantity > 1:
+                    # T1 hit: book 50%, move SL to breakeven, let runner aim for T2
+                    half_qty = position.quantity // 2
+                    position.quantity -= half_qty
+                    position.partial_booked = True
+                    position.sl_price = position.entry_price  # breakeven SL = risk-free runner
+
+                    # Runner target: entry + 2.5R (not current + 1.2R)
+                    # This lets runner capture the full move, not just next tiny leg
+                    risk = abs(position.entry_price - position.entry_sl) if hasattr(position, 'entry_sl') else (position.entry_atr or position.entry_price * 0.01)
+                    if position.direction == "long":
+                        position.target_price = position.entry_price + risk * 2.5
+                    else:
+                        position.target_price = position.entry_price - risk * 2.5
+                    closed.append({
+                        'symbol': position.symbol,
+                        'action': 'PARTIAL',
+                        'reason': 'PARTIAL_T1',
+                        'trade': None,
+                        'partial_qty': half_qty,
+                        'partial_price': current_price,
+                    })
+                else:
+                    result = self.close_position(position.symbol, current_price, "TARGET_HIT")
+                    closed.append({
+                        'symbol': position.symbol,
+                        'action': 'CLOSED',
+                        'reason': 'TARGET_HIT',
+                        'trade': result
+                    })
+
+            else:
+                # Priority 3: Time-based exit — don't let a stalled trade decay to expiry
+                time_reason = self._check_time_exit(position, current_price)
+                if time_reason:
+                    result = self.close_position(position.symbol, current_price, time_reason)
+                    closed.append({
+                        'symbol': position.symbol,
+                        'action': 'CLOSED',
+                        'reason': time_reason,
+                        'trade': result
+                    })
+                    continue
+
+                # Priority 4: Volume dry-up exit
+                df = get_data_func(position.symbol) if get_data_func else None
+                if df is not None and self._check_volume_exit(position, df, current_price):
+                    result = self.close_position(position.symbol, current_price, "VOLUME_EXIT")
+                    closed.append({
+                        'symbol': position.symbol,
+                        'action': 'CLOSED',
+                        'reason': 'VOLUME_EXIT',
+                        'trade': result
+                    })
+                else:
+                    # Priority 5: Trail SL (now activates at 0.5 ATR, not 2 ATR)
+                    atr = position.entry_atr if position.entry_atr > 0 else position.entry_price * 0.02
+                    position.sl_price = self.trail_stop_loss(position, current_price, atr, position.direction)
+
+        return closed
+
+    def get_open_positions(self) -> List[Position]:
+        return self.risk.get_open_positions()
+
+    def get_risk_stats(self) -> Dict:
+        return self.risk.get_stats()
+
+
+if __name__ == '__main__':
+    exec_engine = ExecutionEngine()
+    
+    print("Testing execution engine...")
+    
+    strike = StrikeRecommendation(
+        strike_type="ATM",
+        strike_price=2500,
+        option_type="CE",
+        premium=50,
+        delta=0.5,
+        risk_reward=3,
+        reasoning="Test"
+    )
+    
+    result = exec_engine.execute_trade(
+        symbol="RELIANCE",
+        direction="long",
+        capital=100000,
+        entry_price=2500,
+        atr=50,
+        strike=strike,
+        use_options=False
+    )
+    
+    if result:
+        print(f"Order result: {result.message}")
+    else:
+        print("Trade not executed")
+    
+    print(f"\nRisk stats: {exec_engine.get_risk_stats()}")

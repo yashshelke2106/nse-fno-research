@@ -196,6 +196,7 @@ backtest/        engine.py (walk-forward, holdout) · synthetic.py (GBM)
 tests/           75 tests, all offline
 config.py        parameters only - no credentials
 .env.example     the variables the live data feed reads
+LICENSE          MIT
 ```
 
 ## Limitations
@@ -204,3 +205,11 @@ config.py        parameters only - no credentials
 - The margin model is an estimator (SPAN + exposure + a buffer), not the exchange's number.
 - No market data is included. The event-study guardrails (`leakage_audit`, `event_stat_gate`) run against your own event and price files.
 - The base-breakout detector works on daily bars only.
+
+## License
+
+MIT - see [LICENSE](LICENSE). The software is provided as is, without warranty.
+
+Not affiliated with, endorsed by, or supported by NSE, SEBI or Dhan. Product
+and exchange names are the trademarks of their respective owners. Nothing here
+is investment advice.

@@ -3,7 +3,8 @@ numpy>=1.26
 pandas>=2.0
 pytest>=8.0
 
-# live data feed (not needed for tests or backtests)
+# live data feed (backtests don't use it; tests import the
+# client only to check that live orders stay disabled)
 requests>=2.31
 certifi>=2024.2.2
 urllib3>=2.0

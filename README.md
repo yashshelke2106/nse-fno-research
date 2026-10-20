@@ -1,5 +1,8 @@
 # NSE F&O Research Stack
 
+[![tests](https://github.com/yashshelke2106/nse-fno-research/actions/workflows/tests.yml/badge.svg)](https://github.com/yashshelke2106/nse-fno-research/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A research and paper-trading stack for Indian equities and F&O: a broker data
 feed (Dhan REST + WebSocket), a rule-based signal detector, a margin- and
 cost-aware risk layer, a paper execution layer, and a walk-forward backtester

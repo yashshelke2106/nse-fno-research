@@ -12,6 +12,10 @@ with an itemised Indian cost model and coded research guardrails.
 > included** (see [Safety](#safety)), and the backtests run on this code
 > **did not show a reliable edge** (see [Results](#results)). Nothing here is
 > investment advice.
+>
+> **[Read the case study](CASE_STUDY.md)**: nine bugs that each made a losing
+> system look profitable, or a broken one look healthy, and the guards that
+> now stop them.
 
 The whole test suite, including an end-to-end backtest, runs on synthetic data
 with no broker account:
@@ -69,7 +73,7 @@ a live scan therefore cannot quietly disagree about what a signal is.
 
 ```bash
 pip install -r requirements.txt
-pytest -q                           # 75 tests, no broker account, no network
+pytest -q                           # 76 tests, no broker account, no network
 ```
 
 A backtest on synthetic data:
@@ -183,6 +187,9 @@ repository is published for its engineering: the data plumbing, the cost
 model, the backtester and the research discipline. It is not a strategy, and
 it does not report a track record.
 
+How the results were reached, and the measurement bugs found along the way,
+are written up in [CASE_STUDY.md](CASE_STUDY.md).
+
 ## Safety
 
 - **Live order placement is not included.** `core/api_dhan.py` keeps `place_order`, `modify_order` and `cancel_order` only so call sites read naturally. Each one raises `LiveTradingDisabled`, and the request-building code is not in the repository.
@@ -196,7 +203,7 @@ it does not report a track record.
 ```
 core/            data feed, signal, risk, execution, costs, guardrails
 backtest/        engine.py (walk-forward, holdout) · synthetic.py (GBM)
-tests/           75 tests, all offline
+tests/           76 tests, all offline
 config.py        parameters only - no credentials
 .env.example     the variables the live data feed reads
 LICENSE          MIT

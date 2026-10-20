@@ -89,6 +89,18 @@ def test_pure_noise_does_not_pass():
     assert v.dsr < 0.95
 
 
+def test_a_losing_strategy_is_never_validated():
+    # Regression: with |SR| missing from the default trial dispersion, a
+    # negative Sharpe produced a negative SR0 that the loser then "beat"
+    # (SR -0.05 scored DSR 0.999 and passed).
+    v = dsr.evaluate(sr_hat=-0.05, T=1000, n_trials=10)
+    assert not v.passes
+    assert v.sr0_per_obs >= 0.0
+    rng = random.Random(5)
+    losing = [rng.gauss(-0.05, 1.0) for _ in range(2000)]
+    assert not dsr.evaluate(losing, n_trials=10).passes
+
+
 def test_marginal_edge_killed_by_trial_count():
     """A borderline Sharpe that would pass at N=1 fails once selection over
     many trials is priced in — the whole point of the gate."""
